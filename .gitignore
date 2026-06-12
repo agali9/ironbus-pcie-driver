@@ -1,0 +1,33 @@
+# Kernel build artifacts
+*.ko
+*.o
+.*.cmd
+*.mod
+*.mod.c
+modules.order
+Module.symvers
+
+# Userspace build outputs
+*.so
+demo
+tests/test_edu_device
+
+# Python
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Backups
+*.bak
+*.bak.*
+
+# Full local QEMU source tree / venv (sketch lives in qemu-sketch/)
+/qemu/
+/qemu-venv/
+
+# Duplicate export stash
+/outputs/
+
+# OS
+.DS_Store
+Thumbs.db
