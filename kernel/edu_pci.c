@@ -338,3 +338,133 @@ static int edu_run_dma_test(struct edu_dev *e)
 
 	mutex_lock(&e->lock);
 
+	memcpy(expected, pattern, sizeof(pattern));
+	memcpy(e->dma_virt, pattern, sizeof(pattern));
+
+	/* RAM -> EDU */
+	e->last_irq = 0;
+	writel(0, e->bar0 + EDU_REG_STATUS);
+	writeq((u64)e->dma_handle, e->bar0 + EDU_REG_DMA_SRC);
+	writeq(EDU_DMA_BUF_OFFSET,  e->bar0 + EDU_REG_DMA_DST);
+	writeq(EDU_DMA_TEST_LEN,    e->bar0 + EDU_REG_DMA_CNT);
+	writel(EDU_DMA_CMD_START | EDU_DMA_CMD_IRQ, e->bar0 + EDU_REG_DMA_CMD);
+
+	ret = edu_wait_irq(e, 1000);
+	if (ret)
+		goto out;
+
+	/* EDU -> RAM */
+	memset(e->dma_virt, 0, EDU_DMA_TEST_LEN);
+	e->last_irq = 0;
+	writeq(EDU_DMA_BUF_OFFSET,  e->bar0 + EDU_REG_DMA_SRC);
+	writeq((u64)e->dma_handle,  e->bar0 + EDU_REG_DMA_DST);
+	writeq(EDU_DMA_TEST_LEN,    e->bar0 + EDU_REG_DMA_CNT);
+	writel(EDU_DMA_CMD_START | EDU_DMA_CMD_DIR | EDU_DMA_CMD_IRQ,
+	       e->bar0 + EDU_REG_DMA_CMD);
+
+	ret = edu_wait_irq(e, 1000);
+	if (ret)
+		goto out;
+
+	if (memcmp(e->dma_virt, expected, EDU_DMA_TEST_LEN) != 0) {
+		atomic64_inc(&e->stat_dma_errors);
+		ret = -EIO;
+	} else if (atomic_cmpxchg(&e->inject_fault, 1, 0) == 1) {
+		/* Fault injection: corrupt the result and return EIO */
+		dev_warn(&e->pdev->dev,
+			 "fault injection triggered — reporting DMA error\n");
+		atomic64_inc(&e->stat_dma_errors);
+		ret = -EIO;
+	} else {
+		e->dma_ok = 1;
+	}
+out:
+	mutex_unlock(&e->lock);
+	return ret;
+}
+
+/* -------------------------------------------------------
+ * New ring submit path
+ * ------------------------------------------------------- */
+static int edu_ring_submit(struct edu_dev *e, struct edu_submit_req *req)
+{
+	unsigned long flags;
+	u32 slot;
+
+	spin_lock_irqsave(&e->ring_lock, flags);
+
+	if (ring_full(e->sq_tail, e->cq_head)) {
+		spin_unlock_irqrestore(&e->ring_lock, flags);
+		return -ENOSPC;   /* ring full — caller should retry */
+	}
+
+	slot = e->sq_tail & RING_MASK;
+
+	e->sq[slot].tag     = req->tag;
+	e->sq[slot].opcode  = req->opcode;
+	e->sq[slot].flags   = 0;
+	e->sq[slot].operand = req->operand;
+	e->sq[slot].rsvd    = 0;
+
+	e->inflight[slot] = req->opcode;
+	e->sq_tail = ring_next(e->sq_tail);
+	atomic64_inc(&e->stat_sq_submitted);
+
+	spin_unlock_irqrestore(&e->ring_lock, flags);
+
+	/*
+	 * Kick the hardware based on opcode.
+	 * The IRQ handler will post the CQ entry when done.
+	 */
+	switch (req->opcode) {
+	case EDU_OP_FACTORIAL:
+		writel(EDU_STATUS_IRQ_EN, e->bar0 + EDU_REG_STATUS);
+		writel(req->operand,      e->bar0 + EDU_REG_FACT);
+		break;
+
+	case EDU_OP_DMA_TEST:
+		/*
+		 * Trigger the same RAM->EDU->RAM round-trip as the legacy
+		 * DMA test but via the ring path.
+		 */
+		writel(0, e->bar0 + EDU_REG_STATUS);
+		writeq((u64)e->dma_handle, e->bar0 + EDU_REG_DMA_SRC);
+		writeq(EDU_DMA_BUF_OFFSET, e->bar0 + EDU_REG_DMA_DST);
+		writeq(EDU_DMA_TEST_LEN,   e->bar0 + EDU_REG_DMA_CNT);
+		writel(EDU_DMA_CMD_START | EDU_DMA_CMD_IRQ,
+		       e->bar0 + EDU_REG_DMA_CMD);
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* -------------------------------------------------------
+ * New ring poll-completion path
+ *
+ * Dequeues one entry from the CQ. Returns -EAGAIN if empty.
+ * ------------------------------------------------------- */
+static int edu_poll_cq(struct edu_dev *e, struct edu_completion_req *out)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&e->ring_lock, flags);
+
+	if (e->cq_head == e->cq_tail) {
+		spin_unlock_irqrestore(&e->ring_lock, flags);
+		return -EAGAIN;   /* nothing ready yet */
+	}
+
+	{
+		struct cq_entry *cqe = &e->cq[e->cq_head & RING_MASK];
+		out->tag    = cqe->tag;
+		out->status = cqe->status;
+		out->result = cqe->result;
+	}
+
+	e->cq_head = ring_next(e->cq_head);
+	atomic64_inc(&e->stat_cq_consumed);
+
