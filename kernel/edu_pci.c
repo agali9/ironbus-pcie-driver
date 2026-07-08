@@ -468,3 +468,93 @@ static int edu_poll_cq(struct edu_dev *e, struct edu_completion_req *out)
 	e->cq_head = ring_next(e->cq_head);
 	atomic64_inc(&e->stat_cq_consumed);
 
+	spin_unlock_irqrestore(&e->ring_lock, flags);
+	return 0;
+}
+
+/* -------------------------------------------------------
+ * file_operations
+ * ------------------------------------------------------- */
+static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct miscdevice *mdev = file->private_data;
+	struct edu_dev    *e    = container_of(mdev, struct edu_dev, miscdev);
+
+	switch (cmd) {
+
+	/* ---- legacy ---- */
+	case EDU_IOC_RUN_FACTORIAL: {
+		struct edu_fact_req req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		if (edu_run_factorial(e, &req))
+			return -ETIMEDOUT;
+		if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case EDU_IOC_RUN_DMA_TEST:
+		return edu_run_dma_test(e);
+
+	case EDU_IOC_GET_STATE: {
+		struct edu_state_req state = {
+			.last_irq     = e->last_irq,
+			.last_fact_in  = e->last_fact_in,
+			.last_fact_out = e->last_fact_out,
+			.dma_ok        = e->dma_ok,
+		};
+		if (copy_to_user((void __user *)arg, &state, sizeof(state)))
+			return -EFAULT;
+		return 0;
+	}
+
+	/* ---- new ring ---- */
+	case EDU_IOC_SUBMIT: {
+		struct edu_submit_req req;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+		return edu_ring_submit(e, &req);
+	}
+
+	case EDU_IOC_POLL_CQ: {
+		struct edu_completion_req out = {};
+		int ret;
+
+		ret = edu_poll_cq(e, &out);
+		if (ret)
+			return ret;   /* -EAGAIN if empty */
+		if (copy_to_user((void __user *)arg, &out, sizeof(out)))
+			return -EFAULT;
+		return 0;
+	}
+
+	case EDU_IOC_SET_EVENTFD: {
+		int fd;
+		struct eventfd_ctx *ctx;
+
+		if (copy_from_user(&fd, (void __user *)arg, sizeof(fd)))
+			return -EFAULT;
+
+		ctx = eventfd_ctx_fdget(fd);
+		if (IS_ERR(ctx))
+			return PTR_ERR(ctx);
+
+		/* Replace any previously registered eventfd */
+		if (e->evt_ctx)
+			eventfd_ctx_put(e->evt_ctx);
+		e->evt_ctx = ctx;
+		return 0;
+	}
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+/*
+ * mmap — exposes the entire DMA ring buffer (SQ + CQ) to userspace
+ * as a read/write mapping.  Userspace can inspect SQ/CQ directly
+ * without any copy; the zero-copy path for Phase 3.
