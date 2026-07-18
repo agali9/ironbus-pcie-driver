@@ -558,3 +558,223 @@ static long edu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  * mmap — exposes the entire DMA ring buffer (SQ + CQ) to userspace
  * as a read/write mapping.  Userspace can inspect SQ/CQ directly
  * without any copy; the zero-copy path for Phase 3.
+ *
+ * Usage: ptr = mmap(NULL, DMA_BUF_TOTAL, PROT_READ|PROT_WRITE,
+ *                   MAP_SHARED, fd, 0);
+ */
+static int edu_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct miscdevice *mdev = file->private_data;
+	struct edu_dev    *e    = container_of(mdev, struct edu_dev, miscdev);
+	unsigned long size      = vma->vm_end - vma->vm_start;
+	unsigned long pfn       = virt_to_phys(e->dma_virt) >> PAGE_SHIFT;
+
+	if (size > DMA_BUF_TOTAL)
+		return -EINVAL;
+
+	/*
+	 * On x86, dma_alloc_coherent returns regular cached memory.
+	 * Use default page protection — no pgprot_noncached needed.
+	 */
+	return remap_pfn_range(vma, vma->vm_start, pfn, size,
+			       vma->vm_page_prot);
+}
+
+/*
+ * poll — lets userspace epoll/select on the char device.
+ * Becomes readable when the CQ has at least one entry.
+ */
+static __poll_t edu_poll(struct file *file, poll_table *wait)
+{
+	struct miscdevice *mdev = file->private_data;
+	struct edu_dev    *e    = container_of(mdev, struct edu_dev, miscdev);
+	__poll_t mask = 0;
+
+	/* No wait_queue wired yet — eventfd is the preferred async path.
+	 * This poll() is here for completeness / blocking select() callers. */
+	if (e->cq_head != e->cq_tail)
+		mask |= EPOLLIN | EPOLLRDNORM;
+
+	return mask;
+}
+
+static int edu_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *mdev = file->private_data;
+	struct edu_dev    *e    = container_of(mdev, struct edu_dev, miscdev);
+	unsigned long flags;
+
+	/* Reset ring indices so each open starts with a clean slate */
+	spin_lock_irqsave(&e->ring_lock, flags);
+	e->sq_tail = 0;
+	e->cq_tail = 0;
+	e->cq_head = 0;
+	memset(e->inflight, 0, sizeof(e->inflight));
+	spin_unlock_irqrestore(&e->ring_lock, flags);
+
+	return 0;
+}
+
+static const struct file_operations edu_fops = {
+	.owner          = THIS_MODULE,
+	.open           = edu_open,
+	.unlocked_ioctl = edu_ioctl,
+	.compat_ioctl   = edu_ioctl,
+	.mmap           = edu_mmap,
+	.poll           = edu_poll,
+};
+
+/* -------------------------------------------------------
+ * sysfs fault injection (Phase 7)
+ *
+ * Exposes a single knob on the PCI device:
+ *   /sys/class/misc/edu_pci/device/inject_fault
+ *
+ * Write "1" to arm. The next DMA round-trip will be poisoned
+ * and the driver will return -EIO, exercising the error path.
+ * The flag auto-clears after one fault so normal operation
+ * resumes automatically.
+ *
+ * Example:
+ *   echo 1 | sudo tee /sys/class/misc/edu_pci/device/inject_fault
+ *   sudo ./edu_test   # will see DMA error then recover
+ *   cat /sys/kernel/debug/edu_pci/stats | grep dma_errors
+ * ------------------------------------------------------- */
+
+static ssize_t inject_fault_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct edu_dev *e = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", atomic_read(&e->inject_fault));
+}
+
+static ssize_t inject_fault_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct edu_dev *e = dev_get_drvdata(dev);
+	unsigned int val;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (val > 1)
+		return -EINVAL;
+
+	atomic_set(&e->inject_fault, val);
+	dev_info(dev, "fault injection %s\n", val ? "armed" : "disarmed");
+	return count;
+}
+
+static DEVICE_ATTR_RW(inject_fault);
+
+static struct attribute *edu_sysfs_attrs[] = {
+	&dev_attr_inject_fault.attr,
+	NULL,
+};
+
+static const struct attribute_group edu_sysfs_group = {
+	.attrs = edu_sysfs_attrs,
+};
+
+/* -------------------------------------------------------
+ * debugfs — /sys/kernel/debug/edu_pci/stats (Phase 6)
+ *
+ * Exposes all atomic counters as a human-readable text file.
+ * Read with:  cat /sys/kernel/debug/edu_pci/stats
+ * Reset with: echo 0 > /sys/kernel/debug/edu_pci/stats
+ * ------------------------------------------------------- */
+
+static int edu_dbgfs_stats_show(struct seq_file *m, void *v)
+{
+	struct edu_dev *e = m->private;
+	unsigned long flags;
+	u32 sq_tail, cq_tail, cq_head;
+
+	spin_lock_irqsave(&e->ring_lock, flags);
+	sq_tail = e->sq_tail;
+	cq_tail = e->cq_tail;
+	cq_head = e->cq_head;
+	spin_unlock_irqrestore(&e->ring_lock, flags);
+
+	seq_printf(m, "irq_total         %lld\n",
+		   atomic64_read(&e->stat_irq_total));
+	seq_printf(m, "sq_submitted      %lld\n",
+		   atomic64_read(&e->stat_sq_submitted));
+	seq_printf(m, "cq_posted         %lld\n",
+		   atomic64_read(&e->stat_cq_posted));
+	seq_printf(m, "cq_consumed       %lld\n",
+		   atomic64_read(&e->stat_cq_consumed));
+	seq_printf(m, "dma_errors        %lld\n",
+		   atomic64_read(&e->stat_dma_errors));
+	seq_printf(m, "factorial_ops     %lld\n",
+		   atomic64_read(&e->stat_factorial_ops));
+	seq_printf(m, "eventfd_signals   %lld\n",
+		   atomic64_read(&e->stat_eventfd_signals));
+	seq_printf(m, "ring_sq_tail      %u\n",  sq_tail);
+	seq_printf(m, "ring_cq_tail      %u\n",  cq_tail);
+	seq_printf(m, "ring_cq_head      %u\n",  cq_head);
+	seq_printf(m, "ring_inflight     %u\n",
+		   (cq_tail - cq_head) & RING_MASK);
+	return 0;
+}
+
+static ssize_t edu_dbgfs_stats_write(struct file *file,
+				     const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	struct edu_dev *e = ((struct seq_file *)file->private_data)->private;
+
+	/* Any write resets all counters */
+	atomic64_set(&e->stat_irq_total,       0);
+	atomic64_set(&e->stat_sq_submitted,    0);
+	atomic64_set(&e->stat_cq_posted,       0);
+	atomic64_set(&e->stat_cq_consumed,     0);
+	atomic64_set(&e->stat_dma_errors,      0);
+	atomic64_set(&e->stat_factorial_ops,   0);
+	atomic64_set(&e->stat_eventfd_signals, 0);
+
+	return count;
+}
+
+static int edu_dbgfs_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, edu_dbgfs_stats_show, inode->i_private);
+}
+
+static const struct file_operations edu_dbgfs_stats_fops = {
+	.owner   = THIS_MODULE,
+	.open    = edu_dbgfs_stats_open,
+	.read    = seq_read,
+	.write   = edu_dbgfs_stats_write,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static void edu_debugfs_init(struct edu_dev *e)
+{
+	e->dbgfs_dir = debugfs_create_dir("edu_pci", NULL);
+	if (IS_ERR_OR_NULL(e->dbgfs_dir)) {
+		dev_warn(&e->pdev->dev, "debugfs unavailable — skipping\n");
+		e->dbgfs_dir = NULL;
+		return;
+	}
+	debugfs_create_file("stats", 0644, e->dbgfs_dir, e,
+			    &edu_dbgfs_stats_fops);
+}
+
+static void edu_debugfs_remove(struct edu_dev *e)
+{
+	debugfs_remove_recursive(e->dbgfs_dir);
+	e->dbgfs_dir = NULL;
+}
+
+/* -------------------------------------------------------
+ * PCI probe / remove
+ * ------------------------------------------------------- */
+static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct edu_dev *e;
