@@ -778,3 +778,144 @@ static void edu_debugfs_remove(struct edu_dev *e)
 static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct edu_dev *e;
+	int ret;
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return -ENOMEM;
+
+	e->pdev = pdev;
+	mutex_init(&e->lock);
+	spin_lock_init(&e->ring_lock);
+	init_completion(&e->irq_done);
+	atomic_set(&e->inject_fault, 0);
+
+	/* Ring indices start at 0 */
+	e->sq_tail = 0;
+	e->cq_tail = 0;
+	e->cq_head = 0;
+
+	pci_set_drvdata(pdev, e);
+
+	ret = pci_enable_device(pdev);
+	if (ret)
+		goto err_free;
+
+	ret = pci_request_regions(pdev, DRV_NAME);
+	if (ret)
+		goto err_disable;
+
+	pci_set_master(pdev);
+
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(28));
+	if (ret)
+		goto err_release;
+
+	e->bar0 = pci_iomap(pdev, 0, 0);
+	if (!e->bar0) {
+		ret = -ENOMEM;
+		goto err_release;
+	}
+
+	/*
+	 * Single coherent allocation for the full ring buffer.
+	 * sq points to the start; cq follows immediately after.
+	 */
+	e->dma_virt = dma_alloc_coherent(&pdev->dev, DMA_BUF_TOTAL,
+					 &e->dma_handle, GFP_KERNEL);
+	if (!e->dma_virt) {
+		ret = -ENOMEM;
+		goto err_iounmap;
+	}
+
+	e->sq = (struct sq_entry *)e->dma_virt;
+	e->cq = (struct cq_entry *)((u8 *)e->dma_virt + SQ_SIZE);
+
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_INTX); /* prefer MSI, fall back to INTx */
+	if (ret < 0)
+		goto err_dma_free;
+
+	ret = request_irq(pci_irq_vector(pdev, 0), edu_irq_handler,
+			  0, DRV_NAME, e);
+	if (ret)
+		goto err_irq_vecs;
+
+	e->miscdev.minor = MISC_DYNAMIC_MINOR;
+	e->miscdev.name  = "edu_pci";
+	e->miscdev.fops  = &edu_fops;
+
+	ret = misc_register(&e->miscdev);
+	if (ret)
+		goto err_irq;
+
+	edu_debugfs_init(e);
+
+	ret = sysfs_create_group(&pdev->dev.kobj, &edu_sysfs_group);
+	if (ret)
+		dev_warn(&pdev->dev, "sysfs group creation failed: %d\n", ret);
+
+	dev_info(&pdev->dev,
+		 "edu PCI driver loaded — ring SQ/CQ at dma_handle=0x%llx\n",
+		 (u64)e->dma_handle);
+	return 0;
+
+err_irq:
+	free_irq(pci_irq_vector(pdev, 0), e);
+err_irq_vecs:
+	pci_free_irq_vectors(pdev);
+err_dma_free:
+	dma_free_coherent(&pdev->dev, DMA_BUF_TOTAL, e->dma_virt, e->dma_handle);
+err_iounmap:
+	pci_iounmap(pdev, e->bar0);
+err_release:
+	pci_release_regions(pdev);
+err_disable:
+	pci_disable_device(pdev);
+err_free:
+	kfree(e);
+	return ret;
+}
+
+static void edu_remove(struct pci_dev *pdev)
+{
+	struct edu_dev *e = pci_get_drvdata(pdev);
+
+	edu_debugfs_remove(e);
+	sysfs_remove_group(&pdev->dev.kobj, &edu_sysfs_group);
+	misc_deregister(&e->miscdev);
+	free_irq(pci_irq_vector(pdev, 0), e);
+	pci_free_irq_vectors(pdev);
+
+	if (e->evt_ctx)
+		eventfd_ctx_put(e->evt_ctx);
+
+	if (e->dma_virt)
+		dma_free_coherent(&pdev->dev, DMA_BUF_TOTAL,
+				  e->dma_virt, e->dma_handle);
+
+	if (e->bar0)
+		pci_iounmap(pdev, e->bar0);
+
+	pci_release_regions(pdev);
+	pci_disable_device(pdev);
+	kfree(e);
+}
+
+static const struct pci_device_id edu_tbl[] = {
+	{ PCI_DEVICE(EDU_VENDOR_ID, EDU_DEVICE_ID) },
+	{ 0, }
+};
+MODULE_DEVICE_TABLE(pci, edu_tbl);
+
+static struct pci_driver edu_driver = {
+	.name     = DRV_NAME,
+	.id_table = edu_tbl,
+	.probe    = edu_probe,
+	.remove   = edu_remove,
+};
+
+module_pci_driver(edu_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Ani");
+MODULE_DESCRIPTION("QEMU EDU PCI driver — SQ/CQ ring, eventfd, mmap, DMA, debugfs, fault injection");
