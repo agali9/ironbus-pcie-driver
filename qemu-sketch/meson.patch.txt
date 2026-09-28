@@ -1,0 +1,3 @@
+# Add this to hw/pci/meson.build in a QEMU tree:
+#
+# system_ss.add(files('proto_pcie_device.c'))
