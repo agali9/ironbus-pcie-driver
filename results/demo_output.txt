@@ -1,0 +1,38 @@
+Opened /dev/edu_pci  fd=3
+
+=== Legacy blocking ioctls ===
+  0! = 1
+  1! = 1
+  5! = 120
+  10! = 3628800
+  12! = 479001600
+  DMA test... passed
+  last_irq=0x100  last_fact_in=12  last_fact_out=479001600  dma_ok=1
+
+=== Async SQ/CQ ring path ===
+  Submitting 8 factorial commands (one at a time):
+  tag=0  status=0  result=1  [OK]
+  tag=1  status=0  result=2  [OK]
+  tag=2  status=0  result=6  [OK]
+  tag=3  status=0  result=24  [OK]
+  tag=4  status=0  result=120  [OK]
+  tag=5  status=0  result=720  [OK]
+  tag=6  status=0  result=5040  [OK]
+  tag=7  status=0  result=40320  [OK]
+  Submitting DMA test via ring...
+  tag=255  status=0  result=0  [OK]
+
+=== Zero-copy mmap ring inspection ===
+  SQ base VA = 0x7e7f6b976000
+  CQ base VA = 0x7e7f6b976400
+  After zc submit — SQ[9]: tag=42 opcode=0x1
+  Rings unmapped
+
+=== Fault injection (Phase 7) ===
+  Skipping — sysfs knob not accessible (need root + driver loaded)
+
+=== Throughput benchmark (ring submit) ===
+  64 ops in 151564 µs  →  422 ops/sec
+  avg latency = 2368.19 µs/op
+
+All demos passed.

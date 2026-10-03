@@ -1,0 +1,22 @@
+EduDevice Benchmark — PENDING LIVE RUN
+========================================
+
+Implementation complete (2026-10-05). Live numbers require Linux + QEMU -device edu.
+
+What changed (code):
+  - EDU_IOC_DOORBELL: mmap write SQ + lightweight kick (no descriptor copy)
+  - Driver hw_busy + FIFO kick_idx: real software-pipeline outstanding QD
+  - benchmark.py: QD 1/4/16/64 pipeline, p50/p95/p99, CPU process_time,
+    ioctl vs true ZC comparison
+
+To capture results on the EDU guest:
+
+  cd pcie_prototype_async
+  sudo ./scripts/run_benchmarks.sh
+
+Then replace this file with the harness output.
+
+Prior QD=1 ioctl mean latency (old harness, still directionally useful):
+  ~2026 µs mean @ QD=1 (QEMU EDU, 512 ops)
+
+Prior "throughput vs QD" table is INVALID — harness ignored QD.

@@ -1,0 +1,11 @@
+irq_total         2353
+sq_submitted      2346
+cq_posted         2346
+cq_consumed       2346
+dma_errors        0
+factorial_ops     5
+eventfd_signals   2346
+ring_sq_tail      32
+ring_cq_tail      32
+ring_cq_head      32
+ring_inflight     0
